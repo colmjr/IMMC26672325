@@ -20,6 +20,11 @@ Protection Model (Koopman search theory):
   Coverage:         C_k = λ(k) · c(k)
   Protection:       P_k = 1 - exp(-α · C_k / R_k)
 
+Resources (3 types):
+  Drones  — aerial thermal/optical; primary fire detection, some poaching
+  Rangers — ground patrols; primary anti-poaching, some fire suppression
+  Sensors — fixed camera traps + IR + acoustic; 24/7 poaching surveillance
+
 Optimization:
   Maximize Σ_k P_k  subject to  Σ_k c_n(k) ≤ B_n  for each resource n
 """
@@ -53,15 +58,28 @@ L_RANGER     = 20.0   # ranger deterrence decays over ~20 km
 
 # --- Resource model ---
 # Effectiveness matrix E: rows = resources, cols = risk types [fire, poaching]
+#
+# Literature basis (see report for citations):
+#   Drones:  thermal imaging is primary fire detection tool (0.8); aerial
+#            surveillance aids poaching detection but cannot arrest (0.3)
+#   Rangers: limited fire suppression & prescribed burns (0.2); only resource
+#            that deters, arrests, and removes snares (0.9)
+#   Sensors: fixed camera traps + IR + acoustic; poor spatial fire coverage
+#            (0.15); strong 24/7 poaching surveillance at choke points (0.6)
+#            — AI-powered detection is 17× faster than conventional methods
+#            (Hwange NP acoustic study); WPS wpsWatch platform covers 3500+
+#            connected traps globally with real-time alerts.
+#
 E = np.array([
-    [0.8, 0.3],   # Drones:  strong fire detection, some poaching surveillance
-    [0.2, 0.9],   # Rangers: some fire suppression, strong anti-poaching
+    [0.80, 0.30],   # Drones:  strong fire detection, some poaching surveillance
+    [0.20, 0.90],   # Rangers: some fire suppression, strong anti-poaching
+    [0.15, 0.60],   # Sensors: weak fire detection, strong poaching surveillance
 ])
-RESOURCE_NAMES = ["Drones", "Rangers"]
+RESOURCE_NAMES = ["Drones", "Rangers", "Sensors"]
 N_RESOURCES = len(RESOURCE_NAMES)
 
 # Budgets: total units available for each resource
-BUDGETS = np.array([20.0, 200.0])   # 20 drones, 200 rangers
+BUDGETS = np.array([20.0, 200.0, 50.0])   # 20 drones, 200 rangers, 50 sensor stations
 
 # Resource efficiency (α in the exponential detection model)
 ALPHA = 1.0
@@ -353,8 +371,8 @@ def run_model(data):
     # --- Compute per-cell protection with optimal allocation ---
     for k, d in enumerate(cells):
         c_vec = c_opt[:, k]
-        d['c_drones'] = c_vec[0]
-        d['c_rangers'] = c_vec[1]
+        for n in range(N_RESOURCES):
+            d[f'c_{RESOURCE_NAMES[n].lower()}'] = c_vec[n]
 
         C_k = np.dot(d['lambda'], c_vec)
         d['coverage'] = C_k
@@ -381,21 +399,23 @@ def run_model(data):
 
     # --- Save results ---
     out = "etosha_protectedness_grid.csv"
+    # Build dynamic field list
+    lambda_fields = [f'lambda_{RESOURCE_NAMES[n].lower()}' for n in range(N_RESOURCES)]
+    alloc_fields = [f'c_{RESOURCE_NAMES[n].lower()}' for n in range(N_RESOURCES)]
     fields = ['row', 'col', 'lat', 'lon', 'fire_count', 'ndvi',
-              'r_f', 'r_p', 'risk', 'lambda_drones', 'lambda_rangers',
-              'c_drones', 'c_rangers', 'coverage', 'protection',
-              'protection_uniform', 'in_pan']
+              'r_f', 'r_p', 'risk'] + lambda_fields + alloc_fields + [
+              'coverage', 'protection', 'protection_uniform', 'in_pan']
 
     with open(out, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         w.writeheader()
         for d in cells:
             # Flatten lambda for CSV
-            d['lambda_drones'] = round(d['lambda'][0], 4)
-            d['lambda_rangers'] = round(d['lambda'][1], 4)
+            for n in range(N_RESOURCES):
+                d[f'lambda_{RESOURCE_NAMES[n].lower()}'] = round(d['lambda'][n], 4)
             # Round for readability
-            for key in ['r_f', 'r_p', 'risk', 'c_drones', 'c_rangers',
-                        'coverage', 'protection', 'protection_uniform']:
+            for key in ['r_f', 'r_p', 'risk', 'coverage',
+                        'protection', 'protection_uniform'] + alloc_fields:
                 if key in d:
                     d[key] = round(d[key], 6)
             w.writerow(d)
@@ -423,21 +443,25 @@ def run_model(data):
     # Top 10 highest risk
     top = sorted(cells, key=lambda d: d['risk'], reverse=True)
     print(f"\nTop 10 highest risk cells:")
-    print(f"  {'Lat':>8} {'Lon':>8} {'R':>6} {'r_f':>6} {'r_p':>6} "
-          f"{'Drones':>7} {'Rangers':>8} {'P':>6}")
+    res_hdr = ''.join(f'{RESOURCE_NAMES[n]:>9s}' for n in range(N_RESOURCES))
+    print(f"  {'Lat':>8} {'Lon':>8} {'R':>6} {'r_f':>6} {'r_p':>6} {res_hdr} {'P':>6}")
     for c in top[:10]:
+        res_vals = ''.join(f"{c.get(f'c_{RESOURCE_NAMES[n].lower()}', 0):>9.2f}"
+                           for n in range(N_RESOURCES))
         print(f"  {c['lat']:8.4f} {c['lon']:8.4f} {c['risk']:6.4f} "
-              f"{c['r_f']:6.4f} {c['r_p']:6.4f} "
-              f"{c['c_drones']:7.2f} {c['c_rangers']:8.2f} {c['protection']:6.4f}")
+              f"{c['r_f']:6.4f} {c['r_p']:6.4f} {res_vals} {c['protection']:6.4f}")
 
     # Top 10 most vulnerable (lowest protection among active cells)
     active_cells = [d for d in cells if d['risk'] > 1e-8]
     vuln = sorted(active_cells, key=lambda d: d['protection'])
     print(f"\nTop 10 most vulnerable (lowest protection):")
-    print(f"  {'Lat':>8} {'Lon':>8} {'P':>6} {'R':>6} {'Drones':>7} {'Rangers':>8}")
+    res_hdr = ''.join(f'{RESOURCE_NAMES[n]:>9s}' for n in range(N_RESOURCES))
+    print(f"  {'Lat':>8} {'Lon':>8} {'P':>6} {'R':>6} {res_hdr}")
     for c in vuln[:10]:
+        res_vals = ''.join(f"{c.get(f'c_{RESOURCE_NAMES[n].lower()}', 0):>9.2f}"
+                           for n in range(N_RESOURCES))
         print(f"  {c['lat']:8.4f} {c['lon']:8.4f} {c['protection']:6.4f} "
-              f"{c['risk']:6.4f} {c['c_drones']:7.2f} {c['c_rangers']:8.2f}")
+              f"{c['risk']:6.4f} {res_vals}")
 
     # Resource allocation summary by risk quartile
     sorted_by_risk = sorted(active_cells, key=lambda d: d['risk'])
@@ -449,16 +473,16 @@ def run_model(data):
             ("Med-high (Q3)", sorted_by_risk[2*Q:3*Q]),
             ("High risk (Q4)", sorted_by_risk[3*Q:]),
         ]
+        res_hdr = ''.join(f'{"Σ "+RESOURCE_NAMES[n]:>11s}' for n in range(N_RESOURCES))
         print(f"\nResource allocation by risk quartile:")
-        print(f"  {'Quartile':>16} {'Cells':>6} {'Mean R':>7} {'Mean P':>7} "
-              f"{'Σ Drones':>9} {'Σ Rangers':>10}")
+        print(f"  {'Quartile':>16} {'Cells':>6} {'Mean R':>7} {'Mean P':>7} {res_hdr}")
         for label, qs in quartiles:
             mean_r = np.mean([d['risk'] for d in qs])
             mean_p = np.mean([d['protection'] for d in qs])
-            sum_d = sum(d['c_drones'] for d in qs)
-            sum_r = sum(d['c_rangers'] for d in qs)
-            print(f"  {label:>16} {len(qs):>6} {mean_r:>7.4f} {mean_p:>7.4f} "
-                  f"{sum_d:>9.1f} {sum_r:>10.1f}")
+            res_sums = ''.join(
+                f"{sum(d.get(f'c_{RESOURCE_NAMES[n].lower()}', 0) for d in qs):>11.1f}"
+                for n in range(N_RESOURCES))
+            print(f"  {label:>16} {len(qs):>6} {mean_r:>7.4f} {mean_p:>7.4f} {res_sums}")
 
     # Pan vs non-pan comparison
     pan_cells = [d for d in cells if d['in_pan']]
